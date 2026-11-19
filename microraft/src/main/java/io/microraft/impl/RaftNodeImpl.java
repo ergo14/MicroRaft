@@ -71,6 +71,7 @@ import io.microraft.RaftNodeStatus;
 import io.microraft.exception.CannotReplicateException;
 import io.microraft.exception.IndeterminateStateException;
 import io.microraft.exception.LaggingCommitIndexException;
+import io.microraft.exception.LaggingStateMachineException;
 import io.microraft.exception.NotLeaderException;
 import io.microraft.exception.RaftException;
 import io.microraft.exception.RaftNodeFatalException;
@@ -2042,17 +2043,28 @@ public final class RaftNodeImpl implements RaftNode {
         }
 
         Collection<QueryContainer> operations = queryState.liveQueries();
+        long readIndex = queryState.liveQueriesReadIndex();
+        long lastApplied = state.lastApplied();
 
-        if (LOGGER.isDebugEnabled()) {
-            LOGGER.debug(localEndpointStr + " running " + operations.size() + " queries at commit index: " + commitIndex
-                    + ", query sequence number: " + queryState.querySequenceNumber());
+        // The commit index is ahead of the last applied index only if applying
+        // committed entries failed. Running the queries would read stale state.
+        if (lastApplied < readIndex) {
+            LOGGER.warn("{} failing {} queries since last applied index: {} is smaller than read index: {}",
+                    localEndpointStr, operations.size(), lastApplied, readIndex);
+            queryState.failLiveQueries(new LaggingStateMachineException(lastApplied, readIndex, getLeaderEndpoint()));
+        } else {
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug(localEndpointStr + " running " + operations.size() + " queries at commit index: "
+                        + commitIndex + ", query sequence number: " + queryState.querySequenceNumber());
+            }
+
+            for (QueryContainer query : operations) {
+                query.run(lastApplied, stateMachine);
+            }
+
+            queryState.completeLiveBatch();
         }
 
-        for (QueryContainer query : operations) {
-            query.run(commitIndex, stateMachine);
-        }
-
-        queryState.completeLiveBatch();
         if (queryState.executeQueryIfNotRunning()) {
             broadcastAppendEntriesRequest();
         }
